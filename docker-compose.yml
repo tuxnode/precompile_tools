@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: precompile_tools:latest
+    container_name: precompile_tools
+    volumes:
+      - ./output:/out
+      - ./:/workspace
+    working_dir: /out
+    stdin_open: true
+    tty: true
+    entrypoint: ["/bin/sh"]
